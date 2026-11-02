@@ -4,12 +4,13 @@
 
 针对环境：Android Studio 2026.2.2（`C:\Program Files\Android\Android Studio`）、Windows。
 
-两个脚本，职责分开：
+两个脚本 + 一个代理，职责分开：
 
-| 脚本 | 作用 | 权限 |
+| 文件 | 作用 | 权限 |
 | --- | --- | --- |
-| `patch_studio_gradle_url.py` | 一次性配置：依赖镜像 + 拦截 wrapper 任务 + 改三个 jar 里的地址常量与向导模板 + 刷新哈希清单 + 校准已有工程 | 需管理员（写 Program Files） |
+| `patch_studio_gradle_url.py` | 一次性配置：依赖镜像 + 拦截 wrapper 任务 + 装 Studio 侧地址代理 + 改三个 jar 里的地址常量与向导模板 + 刷新哈希清单 + 校准已有工程 | 改 jar 需要管理员；init 脚本与代理不需要 |
 | `fix_wrapper_sha.py` | 日常维护：改了工程里的版本号后，把哈希刷成官方值，并把主机换回镜像 | 不需要，Studio 开着也能跑 |
+| `studio_mirror_agent/MirrorAgent.java` | javaagent 源码，由上面的脚本编译安装，用来把 Studio 自己算出的发行版地址换成镜像 | 不需要（只改内存里的类） |
 
 ## 两个独立的问题
 
@@ -20,7 +21,7 @@
 | ① 项目依赖 | AGP、androidx、第三方库 | 自动维护 `%USERPROFILE%\.gradle\init.d\mirrors.gradle`（不需要管理员） |
 | ② Gradle 发行版 | `gradle-9.x-bin.zip`，约 140 MB | 改 `android.jar` 内的地址常量（需要管理员） |
 
-发行版地址有**三个写入源**，只堵一个就会出现「改了又变回去」：`android.jar` 的常量（非 Compose 向导）、`kotlin-plugin.jar` 的 Compose 模板、以及 Gradle 自己的 `wrapper` 任务。脚本和前两层打交道用改 jar，最后一层用 init 脚本拦截——所以 `--init-only` 也值得单独跑一次。
+发行版地址有**四个写入源**，只堵一个就会出现「改了又变回去」：`android.jar` 的常量（非 Compose 向导）、`kotlin-plugin.jar` 的 Compose 模板、Gradle 自己的 `wrapper` 任务、以及「Switch to Gradle X」快速修复里 Studio 自己算地址的那一段代码。前两层改 jar，第三层用 init 脚本拦，第四层用 javaagent 换常量——所以 `--init-only` 也值得单独跑一次。
 
 ## 用法
 
@@ -28,7 +29,7 @@
 # 两层一起配（jar 部分需要管理员权限，会弹 UAC）
 python patch_studio_gradle_url.py
 
-# 只配依赖镜像，不碰 android.jar（不需要管理员，Studio 开着也能跑）
+# 只配 init 脚本和代理，不碰 android.jar（不需要管理员）
 python patch_studio_gradle_url.py --init-only
 
 # 手动指定安装目录
@@ -43,13 +44,13 @@ python patch_studio_gradle_url.py --projects=D:/work;D:/demo
 # 跳过第三步（不扫描已有工程）
 python patch_studio_gradle_url.py --no-wrapper-check
 
-# 还原：地址回官方，init 脚本停用，工程地址也回官方
+# 还原：地址回官方，init 脚本停用，代理移除，工程地址也回官方
 python patch_studio_gradle_url.py --restore
 ```
 
-脚本按「init 脚本 → android.jar → 其它插件模板 → 校准已有工程」的顺序执行。前两步分别对应「依赖慢」和「发行版慢」，第三步处理 Compose 等工程用的另一套模板，第四步把你机器上**已经存在**的工程 wrapper 校准过来——包括你手动改了版本号但没改哈希、或者被 Studio 改回官方主机的那些。
+脚本按「init 脚本 → Studio 侧代理 → android.jar → 其它插件模板 → 校准已有工程」的顺序执行。前两层不需要管理员，分别对应「依赖慢」和「`Switch to Gradle X` 先写官方地址」；第三、四步改向导模板；第五步把你机器上**已经存在**的工程 wrapper 校准过来——包括你手动改了版本号但没改哈希、或者被 Studio 改回官方主机的那些。
 
-配完**重启 Android Studio**（这些 jar 在启动时加载），再新建项目验证生成的文件：
+配完**重启 Android Studio**（jar 和 vmoptions 都只在启动时读一次），再新建项目或点 Switch 验证生成的文件：
 
 ```properties
 distributionUrl=https\://mirrors.tencent.com/gradle/gradle-9.6.0-bin.zip
@@ -193,17 +194,21 @@ Test of distribution url https://services.gradle.org/distributions/gradle-9.8.2-
 ```groovy
 gradle.allprojects { project ->
     project.tasks.withType(org.gradle.api.tasks.wrapper.Wrapper).configureEach { task ->
-        def current = task.distributionUrl
-        if (current != null && current.contains('services.gradle.org')) {
-            task.distributionUrl = current.replace(
-                    'https://services.gradle.org/distributions/',
-                    'https://mirrors.tencent.com/gradle/')
+        task.doFirst {
+            def url = task.distributionUrl
+            if (url != null && url.contains('services.gradle.org/distributions/')) {
+                task.distributionUrl = url.replace(
+                        'https://services.gradle.org/distributions/',
+                        'https://mirrors.tencent.com/gradle/')
+            }
         }
     }
 }
 ```
 
-拦截这一层比改模板更管用：不管 Studio 从哪条路径触发 `wrapper` 任务（向导、Switch 意图、Sync 时的版本校验），写出来的地址都会被换回镜像。
+**必须是 `doFirst`，不能是 `configureEach`。** 任务动作在配置之后才跑，`configureEach` 阶段设的值可能被后面的配置（比如 Studio 注入的 init 脚本里 `wrapper.gradleVersion = '9.8.2'`）覆盖；放到 `doFirst` 里，文件落盘前最后改一次，写出来必是镜像。这样不管 Studio 从哪条路径触发 `wrapper` 任务（向导、Switch 意图、Sync 时的版本校验），写出来的地址都会直接是镜像。
+
+不过这一层只解决「Gradle 写的那一次」。`Switch to Gradle 9.8.2` 还有另一次写入在 Gradle 之前，见「第七个坑」。
 
 实测（Gradle 9.8.2 真实执行，含 URL 校验）：
 
@@ -246,7 +251,66 @@ Copy-Item "$lib\intellij.gradle.jar.original" "$lib\intellij.gradle.jar" -Force
 
 顺带一个附带的坑：`os.replace` 往 Program Files 里写新文件会**丢掉 Users 的读权限**（继承被切断，只剩 SYSTEM/Administrators/当前用户）。IDE 以别的账户跑就读不到，现在脚本每次写完都会 `icacls /inheritance:e` 补回来。
 
-## 第四步：校准已有工程
+## 第七个坑：点了 Switch，先官方、一秒后才变腾讯云
+
+init 脚本拦住 `wrapper` 任务之后，文件最终是镜像地址，但点「Switch to Gradle 9.8.2 and re-sync」的一瞬间还是能看到官方地址闪一下，约一秒后才变镜像。
+
+原因是**写文件的不止 Gradle，Studio 自己先写了一次**。这个快速修复在 Gradle 插件里：
+
+```
+GradleVersionQuickFix.updateOrCreateWrapper()
+  ├─ 算出 WrapperConfiguration，把 distribution 覆盖成 GradleUtil.getWrapperDistributionUri(version)
+  ├─ Document.setText(...)           ← 直接写 gradle-wrapper.properties，此刻是官方地址
+  └─ runWrapperTask() -> gradle wrapper   ← 之后才跑，被 init 脚本改成镜像
+```
+
+`GradleUtil.getWrapperDistributionUri()` 的地址是拼出来的：
+
+```java
+String base = System.getProperty("idea.gradle.servicesUrl", "https://services.gradle.org");
+String kind = version.isSnapshot() ? "distributions-snapshots" : "distributions";
+return URI.create(String.format("%s/%s/gradle-%s-bin.zip", base, kind, version.getVersion()));
+```
+
+所以只改 `android.jar` 的常量没用——那个常量是新建向导路径用的，`Switch` 走的是这里。日志里能对上：`About to execute Gradle tasks: [wrapper]` 在写文件之后，而且**没有** `--gradle-distribution-url` 参数。
+
+`idea.gradle.servicesUrl` 这个属性可以覆盖 base，但镜像的路径是 `mirrors.tencent.com/gradle/gradle-X-bin.zip`，中间没有 `distributions` 这一段，光换 base 会拼成 `…/gradle/distributions/gradle-X-bin.zip`（404）。
+
+**改法：javaagent 在类加载时换掉这两段字符串**（脚本第二步）：
+
+| 位置 | 原值 | 换成 |
+| --- | --- | --- |
+| `GradleEnvironment$Urls` | `https://services.gradle.org` | `https://mirrors.tencent.com/gradle` |
+| `GradleUtil` | `%s/%s/gradle-%s-bin.zip` | `%1$s/gradle-%3$s-bin.zip`（丢掉中间的 distributions） |
+
+用 javaagent 而不是再改一个 jar，是因为上一个坑说明了改 `intellij.gradle.jar` 会让整个模块加载失败；agent 只在内存里换常量，**硬盘上的 jar 一个字节都不动**。
+
+脚本会做这些：
+
+- 用 Studio 自带的 `jbr/bin/javac` 编译 `studio_mirror_agent/MirrorAgent.java`，产物放到 `%USERPROFILE%\.gradle\studio-mirror-agent\mirror-agent.jar`；
+- 首次运行时用 Studio 自带的 `bin/studio64.exe.vmoptions` 抄一份到 `%APPDATA%\Google\AndroidStudio2026.2.2\studio64.exe.vmoptions`，再追加一行 `-javaagent:...`（不会把默认的 `-Xmx2048m` 等参数弄丢）；
+- 已存在该文件就只补这一行；`--restore` 只删这一行和它的注释。
+
+验证（不需要开 Studio）：
+
+```
+> java -javaagent:%USERPROFILE%\.gradle\studio-mirror-agent\mirror-agent.jar -cp ... T2
+
+getWrapperDistributionUri(9.8.2) = https://mirrors.tencent.com/gradle/gradle-9.8.2-bin.zip
+getGradleServicesUrl()           = https://mirrors.tencent.com/gradle
+```
+
+代理是否生效，看 `%USERPROFILE%\.gradle\mirrors-agent.log`：
+
+```
+2026-11-02 11:01:54  agent loaded
+2026-11-02 11:01:54  patched org/jetbrains/plugins/gradle/util/GradleUtil (32162 -> 32163)
+2026-11-02 11:01:55  patched org/jetbrains/plugins/gradle/util/GradleEnvironment$Urls (1549 -> 1556)
+```
+
+**改完必须重启 Studio**（vmoptions 只在启动时读一次），之后点 Switch 会一次写成镜像，不再闪。想彻底退掉：`python patch_studio_gradle_url.py --restore`，或手动删掉 vmoptions 里 `-javaagent:` 那一行。
+
+## 第五步：校准已有工程
 
 `distributionUrl` 在工程目录里，jar 管不到，所以改完 jar 后会扫描已有工程：
 
@@ -282,7 +346,7 @@ Copy-Item "$lib\intellij.gradle.jar.original" "$lib\intellij.gradle.jar" -Force
 
 - **Studio 升级会覆盖 `android.jar`、`kotlin-plugin.jar`、`intellij.gradle.jar`**，升级后需重跑一次脚本（会弹 UAC，且要先退出 Studio）。
 - 快照版 Gradle 会指向镜像上不存在的路径，但新建项目向导不会用快照版本，实际碰不到。
-- 已有工程由第四步自动校准；如果后来又手动改过版本号或被 Studio 改回官方主机，重跑脚本或 `fix_wrapper_sha.py` 即可，不用手抄哈希。
+- 已有工程由第五步自动校准；如果后来又手动改过版本号或被 Studio 改回官方主机，重跑脚本或 `fix_wrapper_sha.py` 即可，不用手抄哈希。
 - 工程里出现没有 `distributionSha256Sum` 的文件是正常的：Compose 模板本来就不写这一行，不代表被改坏。
 
 ## 已经报校验失败的项目怎么救

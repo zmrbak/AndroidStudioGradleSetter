@@ -1,1 +1,3 @@
-.workbuddy/memory/2026-11-02.md
+.workbuddy/
+__pycache__/
+patch_studio_gradle_url.log

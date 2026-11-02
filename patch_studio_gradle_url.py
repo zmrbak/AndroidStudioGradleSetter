@@ -13,7 +13,7 @@ getDistributionUrl() 用格式串拼完整地址：
 distributionSha256Sum。所以只改模板 properties 会被覆盖，必须连这个
 格式串一起改。
 
-本脚本做四件事。
+本脚本做五件事。
 
 一、写 %USERPROFILE%\.gradle\init.d\mirrors.gradle（用户目录，不需要管理员）
     1. beforeSettings 在项目 settings 脚本之前注入腾讯云仓库，让依赖走国内；
@@ -22,19 +22,32 @@ distributionSha256Sum。所以只改模板 properties 会被覆盖，必须连�
        这个任务，它按现有地址或官方 DistributionLocator 重写文件——不拦它，
        模板改得再对也会被改回 services.gradle.org。
 
-二、改 android.jar 内三处（需要管理员权限）
+二、给 Studio 装一个 javaagent（用户目录，不需要管理员）
+    init 脚本只能改 Gradle 那一次写入；「Switch to Gradle X and re-sync」
+    是 Gradle 插件的 GradleVersionQuickFix 先自己算地址、写进编辑器文档，
+    再跑 wrapper 任务，于是文件先出现官方地址、约一秒后才被改成镜像。
+    算地址的地方是：
+        GradleUtil.getWrapperDistributionUri(version)
+          = String.format("%s/%s/gradle-%s-bin.zip",
+                          System.getProperty("idea.gradle.servicesUrl",
+                                             "https://services.gradle.org"),
+                          "distributions", version)
+    代理在类加载时把这两段字符串换成腾讯云，Studio 第一次写出来的就是镜像。
+    硬盘上的插件 jar 一个字节都不动，删掉 vmoptions 里那一行即完全回退。
+
+三、改 android.jar 内三处（需要管理员权限）
   1. 格式串 -> https://mirrors.tencent.com/gradle/%2$s
   2. 模板 gradle-wrapper.properties 的 distributionUrl -> 腾讯云
   3. 用官方版本索引刷新 templates/project/gradle-sha256-list.txt
 
-三、改另外两个插件里的向导模板（需要管理员权限）
+四、改另外两个插件里的向导模板（需要管理员权限）
   Compose 工程走的是 Kotlin 插件的模板，不是 android.jar：
     kotlin-plugin.jar / fileTemplates/code/compose-gradle-wrapper.properties.ft
     kotlin-plugin.jar / .../projectWizard/templates/gradle/gradle-wrapper.properties.vm
   这两份硬编码了官方地址，也没有 distributionSha256Sum，新建 Compose 工程
   时地址就是官方的。intellij.gradle.jar 里生成 build 脚本的模板一并处理。
 
-四、校准已有工程的 wrapper 哈希（不需要管理员）
+五、校准已有工程的 wrapper 哈希（不需要管理员）
 
 第 3 条的必要性：Studio 用「Switch to Gradle X」这类意图改 wrapper 时，
 URL 换成 X，但哈希是从这个清单里查 gradle-X-bin.zip 得到的。清单是
@@ -47,16 +60,18 @@ Studio 发布时的快照，比清单新的版本查不到值，Studio 就沿用
 刷新后清单覆盖官方全部正式版，这个坑不会再出现。
 
 注意：
-  - 第二、第三步需要管理员权限（写 Program Files）。
+  - 第三、第四步需要管理员权限（写 Program Files）。
   - Studio 升级会覆盖这些 jar，升级后重跑本脚本即可。
   - 保留官方 sha256 不动：腾讯云镜像提供的是官方原包，校验仍然通过。
+  - 第二步改的是 %APPDATA%\Google\AndroidStudio*\studio64.exe.vmoptions，
+    改完要重启 Studio 才生效。
 
 用法：
-  python patch_studio_gradle_url.py                    # 四步全做
+  python patch_studio_gradle_url.py                    # 五步全做
   python patch_studio_gradle_url.py "D:/Android Studio"
-  python patch_studio_gradle_url.py --init-only        # 只维护 init 脚本，不碰 jar
+  python patch_studio_gradle_url.py --init-only        # 只维护 init 脚本和代理，不碰 jar
   python patch_studio_gradle_url.py --home=D:/Users/me # 指定用户目录
-  python patch_studio_gradle_url.py --restore          # 还原官方地址、停用 init 脚本
+  python patch_studio_gradle_url.py --restore          # 还原官方地址、停用 init 脚本与代理
 """
 
 import atexit
@@ -179,17 +194,20 @@ beforeSettings { settings ->
 }
 
 // Studio 的「Switch to Gradle X」和工程向导会执行 Gradle 自带的 wrapper 任务，
-// 由它重写 gradle-wrapper.properties。该任务会沿用现有地址、或按官方
-// DistributionLocator 生成 services.gradle.org 的地址，于是模板改了也会被它改回去。
-// 这里在任务配置阶段把官方主机换成镜像，写出来的就始终是国内地址。
+// 由它重写 gradle-wrapper.properties。它习惯用 --gradle-distribution-url 传地址，
+// 而命令行参数是在 configureEach 之后才应用的，会把这里设的值盖回官方地址
+// （还会拿 services.gradle.org 做 HEAD 校验，国内一路卡到超时再失败）。
+// 所以改到 doFirst：此时参数已经应用、文件还没落盘，替换后写出来的就是镜像地址。
 // 只动主机段，版本号和 -bin/-all 后缀保持原样。
 gradle.allprojects { project ->
     project.tasks.withType(org.gradle.api.tasks.wrapper.Wrapper).configureEach { task ->
-        def current = task.distributionUrl
-        if (current != null && current.contains('services.gradle.org')) {
-            task.distributionUrl = current.replace(
-                    'https://services.gradle.org/distributions/',
-                    'https://mirrors.tencent.com/gradle/')
+        task.doFirst {
+            def url = task.distributionUrl
+            if (url != null && url.contains('services.gradle.org/distributions/')) {
+                task.distributionUrl = url.replace(
+                        'https://services.gradle.org/distributions/',
+                        'https://mirrors.tencent.com/gradle/')
+            }
         }
     }
 }
@@ -686,6 +704,154 @@ def studio_root_from_jar(jar):
     return d
 
 
+# ---------- Studio 侧地址代理（javaagent，不需要管理员） ----------
+# 「Switch to Gradle X and re-sync」这个快速修复由 Gradle 插件实现：
+#   GradleVersionQuickFix.updateOrCreateWrapper() 先自己算出地址、写进编辑器文档，
+#   再调用 Gradle 的 wrapper 任务重写一遍。地址来自
+#     GradleUtil.getWrapperDistributionUri(version)
+#       = String.format("%s/%s/gradle-%s-bin.zip",
+#                       System.getProperty("idea.gradle.servicesUrl", "https://services.gradle.org"),
+#                       "distributions", version)
+#   于是文件先出现官方地址，约一秒后 wrapper 任务（被 init 脚本拦下）改成镜像，
+#   这就是"先官方、一秒后腾讯云"的来源。init 脚本改不到这一步，只能从 Studio 侧换地址。
+#
+# 改 Studio 的插件 jar 风险高（见 GRADLE_PLUGIN_JAR 注释），所以用 javaagent 在
+# 类加载进内存时把上面两个字符串换掉，硬盘上的 jar 一个字节都不动，
+# 从 vmoptions 里删掉那一行即完全回退。
+
+AGENT_DIR = "studio-mirror-agent"
+AGENT_JAR = "mirror-agent.jar"
+AGENT_SRC_REL = os.path.join("studio_mirror_agent", "MirrorAgent.java")
+AGENT_MARK = "# Gradle 镜像代理（patch_studio_gradle_url.py 管理）"
+AGENT_VMOPT = "-javaagent:"
+
+
+def agent_home(home):
+    return os.path.join(home, ".gradle", AGENT_DIR)
+
+
+def build_agent(studio_root, home):
+    """编译 MirrorAgent.java 并打包成 agent jar，返回 jar 路径"""
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), AGENT_SRC_REL)
+    if not os.path.isfile(src):
+        raise IOError("找不到 %s" % AGENT_SRC_REL)
+    javac = os.path.join(studio_root, "jbr", "bin", "javac.exe")
+    jar_tool = os.path.join(studio_root, "jbr", "bin", "jar.exe")
+    for exe in (javac, jar_tool):
+        if not os.path.isfile(exe):
+            raise IOError("找不到 %s" % exe)
+
+    dest = agent_home(home)
+    classes = os.path.join(dest, "_classes")
+    if os.path.isdir(classes):
+        shutil.rmtree(classes)
+    os.makedirs(classes)
+    subprocess.run([javac, "-encoding", "UTF-8", "--release", "11",
+                    "-d", classes, src], check=True,
+                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+    manifest = os.path.join(dest, "manifest.txt")
+    with open(manifest, "w", encoding="utf-8", newline="\n") as f:
+        f.write("Premain-Class: MirrorAgent\n")
+        f.write("Can-Retransform-Classes: false\n")
+        f.write("Can-Redefine-Classes: false\n")
+
+    out = os.path.join(dest, AGENT_JAR)
+    if os.path.exists(out):
+        os.remove(out)
+    subprocess.run([jar_tool, "--create", "--file", out, "--manifest", manifest,
+                    "-C", classes, "."], check=True,
+                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    shutil.rmtree(classes, ignore_errors=True)
+    return out
+
+
+def vmoptions_files(home):
+    appdata = os.environ.get("APPDATA") or os.path.join(home, "AppData", "Roaming")
+    pattern = os.path.join(appdata, "Google", "AndroidStudio*", "studio64.exe.vmoptions")
+    return sorted(glob.glob(pattern))
+
+
+def find_config_dir(home):
+    appdata = os.environ.get("APPDATA") or os.path.join(home, "AppData", "Roaming")
+    dirs = [d for d in glob.glob(os.path.join(appdata, "Google", "AndroidStudio*"))
+            if os.path.isdir(d)]
+    if not dirs:
+        return None
+    # 取最新的一个（按目录名，AndroidStudio2026.2.2 > AndroidStudio2025.1）
+    return sorted(dirs)[-1]
+
+
+def ensure_vmoption(path, line, restore):
+    """在 vmoptions 里加/删 javaagent 行；文件不存在时用 Studio 自带默认值初始化"""
+    if restore:
+        if not os.path.isfile(path):
+            return "无 vmoptions，跳过"
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+        kept = [l for l in lines
+                if not (l.strip().startswith(AGENT_VMOPT) and AGENT_DIR in l)
+                and l.strip() != AGENT_MARK]
+        if len(kept) == len(lines):
+            return "未启用，跳过"
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(kept).rstrip() + "\n")
+        return "已移除代理行"
+
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+        if any(AGENT_DIR in l and l.strip().startswith(AGENT_VMOPT) for l in lines):
+            return "已启用，跳过"
+    else:
+        lines = []
+    lines.append(AGENT_MARK)
+    lines.append(AGENT_VMOPT + line)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines).rstrip() + "\n")
+    return "已写入 %s" % os.path.basename(path)
+
+
+def install_agent(studio_root, restore, home):
+    """装/卸 javaagent。返回 True 表示已就绪"""
+    if not studio_root or not os.path.isdir(studio_root):
+        print("未定位到 Studio 安装目录，跳过")
+        return False
+
+    targets = vmoptions_files(home)
+    if not targets:
+        cfg = find_config_dir(home)
+        if cfg:
+            targets = [os.path.join(cfg, "studio64.exe.vmoptions")]
+
+    if restore:
+        if not targets:
+            print("未找到 Studio 配置目录，无需处理")
+        for p in targets:
+            print("%s（%s）" % (p, ensure_vmoption(p, "", restore)))
+        return True
+
+    try:
+        jar = build_agent(studio_root, home)
+    except Exception as e:
+        print("编译代理失败: %s: %s" % (type(e).__name__, e))
+        return False
+    print("代理 jar: %s" % jar)
+
+    if not targets:
+        print("未找到 %APPDATA%\\Google\\AndroidStudio* 配置目录，请手动在 vmoptions 中加：")
+        print("  %s%s" % (AGENT_VMOPT, jar))
+        return False
+
+    # 首次创建 vmoptions 时，先抄一份 Studio 自带默认值，避免把默认堆等参数丢掉
+    bundled = os.path.join(studio_root, "bin", "studio64.exe.vmoptions")
+    for p in targets:
+        if not os.path.isfile(p) and os.path.isfile(bundled):
+            shutil.copyfile(bundled, p)
+        print("%s（%s）" % (p, ensure_vmoption(p, jar, restore)))
+    return True
+
+
 def main():
     raw = sys.argv[1:]
     args = [a for a in raw if not a.startswith("--")]
@@ -702,15 +868,21 @@ def main():
     print("== 第一步：init 脚本（依赖镜像 + wrapper 任务地址改写，无需管理员）==")
     ensure_init_script(restore, home)
 
+    print()
+    print("== 第二步：Studio 侧地址代理（「Switch to Gradle X」直接写镜像，无需管理员）==")
+    user_home = home or os.path.expanduser("~")
+    guess_jar = find_jar(args[0] if args else None)
+    install_agent(studio_root_from_jar(guess_jar) if guess_jar else None, restore, user_home)
+
     if "--init-only" in raw:
         print()
-        print("仅维护 init 脚本，已跳过 jar 改写")
+        print("仅维护 init 脚本与代理，已跳过 jar 改写")
         return 0
 
     print()
-    print("== 第二步：Gradle 发行版地址（android.jar，需管理员）==")
+    print("== 第三步：Gradle 发行版地址（android.jar，需管理员）==")
     extra = {} if restore else fetch_checksums()
-    jar = find_jar(args[0] if args else None)
+    jar = guess_jar
     jar_ok = False
     if not jar:
         print("未找到 android.jar，请传入 Android Studio 安装目录")
@@ -754,7 +926,7 @@ def main():
             print("  %s -> %s" % (key, val or "缺失"))
 
     print()
-    print("== 第三步：其它向导模板（Compose 等，需管理员）==")
+    print("== 第四步：其它向导模板（Compose 等，需管理员）==")
     if not jar:
         print("未找到 Studio 安装目录，跳过")
     else:
@@ -786,7 +958,7 @@ def main():
         return 0 if jar_ok else 1
 
     print()
-    print("== 第四步：校准已有工程的 wrapper ==")
+    print("== 第五步：校准已有工程的 wrapper ==")
     roots = proj_arg.split(";") if proj_arg else default_project_roots(home or os.path.expanduser("~"))
     fix_wrappers(roots, extra, restore)
 
